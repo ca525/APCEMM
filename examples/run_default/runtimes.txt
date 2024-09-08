@@ -1,0 +1,1 @@
+Casenum 1 runtime: 0.03915691375732422 secondsCasenum 1 runtime: 3176.391920566559 secondsCasenum 1 runtime: 5477.147521734238 seconds
