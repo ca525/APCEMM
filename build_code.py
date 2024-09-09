@@ -44,20 +44,20 @@ def build_code(foldername):
     os.system(f"mkdir {foldername}")
     os.system(f"cd {foldername} && cmake ../Code.v05-00 && cmake --build .")
 
-if __name__ == "__main__":
-    ithresh_list = ["1e2", "1e4"]
-    cthresh_list = ["0.1", "0.3", "0.5"]
-    # dir_path = os.path.dirname(os.path.realpath(__file__))
-    # print(dir_path)
-
+def build_ithresh_code(ithresh_list):
     for ithresh in ithresh_list:
         foldername = "build_icenum" + ithresh
         reset_plume_model()
         update_ithresh(ithresh = ithresh)
         build_code(foldername)
 
+def build_cthresh_code(cthresh_list):
     for cthresh in cthresh_list:
         foldername = "build_thresh" + cthresh
         reset_plume_model()
         update_cthresh(cthresh = cthresh)
         build_code(foldername)
+
+if __name__ == "__main__":
+    # build_ithresh_code(["1e2", "1e4"])
+    build_cthresh_code(["0.1", "0.3", "0.5"])
