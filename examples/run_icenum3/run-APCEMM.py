@@ -328,7 +328,7 @@ if __name__ == "__main__" :
     end = time.time()
     runtime = end-start
 
-    with open("runtimes.txt", 'a+') as f:
+    with open("runtimes.txt", 'w') as f:
         f.write(f"Casenum {casenum} runtime: {runtime} seconds")
         
     # write_shear()
