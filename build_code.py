@@ -44,20 +44,47 @@ def build_code(foldername):
     os.system(f"mkdir {foldername}")
     os.system(f"cd {foldername} && cmake ../Code.v05-00 && cmake --build .")
 
-def build_ithresh_code(ithresh_list):
+def edit_script(casename):
+    scriptpath = f"examples/run_{casename}/run-APCEMM.py"
+    f = open(scriptpath, "r")
+    lines = f.readlines()
+    f.close()
+
+    lines_modified = lines
+    lines_modified[273] = f"    os.system('./../../build_{casename}/APCEMM input.yaml')\n"
+
+    f = open(scriptpath, "w")
+    f.writelines(lines_modified)
+    f.close()
+
+def make_example(casename):
+    os.system(f"cp -R examples/run_example examples/run_{casename}")
+    edit_script(casename)
+
+def build_and_run_ithresh_code(ithresh_list):
     for ithresh in ithresh_list:
-        foldername = "build_icenum" + ithresh
+        casename = "icenum" + ithresh
+        foldername = "build_" + casename
         reset_plume_model()
         update_ithresh(ithresh = ithresh)
         build_code(foldername)
 
-def build_cthresh_code(cthresh_list):
+        make_example(casename)
+        os.system(f"python3 examples/run_{casename}/run-APCEMM.py")
+
+def build_and_run_cthresh_code(cthresh_list):
     for cthresh in cthresh_list:
-        foldername = "build_thresh" + cthresh
+        casename = "thresh" + cthresh
+        foldername = "build_" + casename
         reset_plume_model()
         update_cthresh(cthresh = cthresh)
         build_code(foldername)
 
+        make_example(casename)
+        os.system(f"python3 examples/run_{casename}/run-APCEMM.py")
+
 if __name__ == "__main__":
-    # build_ithresh_code(["1e2", "1e4"])
-    build_cthresh_code(["0.1", "0.3", "0.5"])
+    # # build_and_run_ithresh_code(["1e2", "1e4"])
+    build_and_run_cthresh_code(["0.1", "0.3", "0.5"])
+
+    # make_example("banana")
