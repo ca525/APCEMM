@@ -58,33 +58,39 @@ def edit_script(casename):
     f.close()
 
 def make_example(casename):
+    # TODO: Debug this - it is doing sussy things
     os.system(f"cp -R examples/run_example examples/run_{casename}")
-    edit_script(casename)
+    edit_script(casename)        
 
-def build_and_run_ithresh_code(ithresh_list):
+def build_ithresh_code(ithresh_list):
     for ithresh in ithresh_list:
         casename = "icenum" + ithresh
         foldername = "build_" + casename
         reset_plume_model()
         update_ithresh(ithresh = ithresh)
         build_code(foldername)
-
         make_example(casename)
-        os.system(f"python3 examples/run_{casename}/run-APCEMM.py")
 
-def build_and_run_cthresh_code(cthresh_list):
+def build_cthresh_code(cthresh_list):
     for cthresh in cthresh_list:
         casename = "thresh" + cthresh
         foldername = "build_" + casename
         reset_plume_model()
         update_cthresh(cthresh = cthresh)
         build_code(foldername)
-
         make_example(casename)
-        os.system(f"python3 examples/run_{casename}/run-APCEMM.py")
 
-if __name__ == "__main__":
-    # # build_and_run_ithresh_code(["1e2", "1e4"])
-    build_and_run_cthresh_code(["0.1", "0.3", "0.5"])
+def run_ithresh_code(ithresh_list):
+    for ithresh in ithresh_list:
+        casename = "icenum" + ithresh
+        os.system(f"cd examples/run_{casename} && python3 run-APCEMM.py")
 
-    # make_example("banana")
+def run_cthresh_code(cthresh_list):
+    for cthresh in cthresh_list:
+        casename = "thresh" + cthresh
+        os.system(f"cd examples/run_{casename} && python3 run-APCEMM.py")
+
+if __name__ == "__main__":  
+    cthresh_list = ["0.70", "0.80", "0.90"]
+    build_cthresh_code(cthresh_list)
+    # run_cthresh_code(cthresh_list)
