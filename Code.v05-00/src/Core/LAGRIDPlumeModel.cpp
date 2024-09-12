@@ -2,14 +2,26 @@
 #include "AIM/Settling.hpp"
 #include "Util/PlumeModelUtils.hpp"
 #include "Core/Status.hpp"
-#include "Core/SZA.hpp"
+#include "KPP/KPP_Parameters.h"
 #include "Core/LAGRIDPlumeModel.hpp"
+
+/*
+These global variables are required because of the KPP auto-generated code.
+In the LAGRID Plume Model (no plume chemistry), the KPP is used only when
+spinning up the background ambient conditions during the initialization 
+step of the EPM. For now declare these variables at the top level.
+*/
+double RCONST[NREACT];       /* Rate constants (global) */
+double NOON_JRATES[NPHOTOL]; /* Noon-time photolysis rates (global) */
+double PHOTOL[NPHOTOL];      /* Photolysis rates (global) */
+double HET[NSPEC][3];        /* Heterogeneous chemistry rates (global) */
+double TIME;                 /* Current integration time (global) */
+double SZA_CST[3];           /* Require this for adjoint integration */
 
 LAGRIDPlumeModel::LAGRIDPlumeModel( const OptInput &optInput, const Input &input ):
     optInput_(optInput),
     input_(input),
     numThreads_(optInput.SIMULATION_OMP_NUM_THREADS),
-    sun_(SZA(input.latitude_deg(), input.emissionDOY())),
     aircraft_(Aircraft(input, optInput.SIMULATION_INPUT_ENG_EI)),
     jetA_(Fuel("C12H24")),
     simVars_(MPMSimVarsWrapper(input, optInput)),
@@ -20,7 +32,7 @@ LAGRIDPlumeModel::LAGRIDPlumeModel( const OptInput &optInput, const Input &input
 
     EI_ = Emission( aircraft_.engine(), jetA_ );
 
-    timestepVars_.setTimeArray(PlumeModelUtils::BuildTime ( timestepVars_.tInitial_s, timestepVars_.tFinal_s, 3600.0*sun_.sunRise, 3600.0*sun_.sunSet, timestepVars_.dt ));
+    timestepVars_.setTimeArray(PlumeModelUtils::BuildTime ( timestepVars_.tInitial_s, timestepVars_.tFinal_s, timestepVars_.dt ));
 
     createOutputDirectories();
 }
@@ -51,14 +63,6 @@ SimStatus LAGRIDPlumeModel::runFullModel() {
         std::cout << "\n";
         std::cout << "\n - Time step: " << timestepVars_.nTime + 1 << " out of " << timestepVars_.timeArray.size();
         std::cout << "\n -> Solar time: " << std::fmod( timestepVars_.curr_Time_s/3600.0, 24.0 ) << " [hr]" << std::endl;
-        
-        //Declaring variables needed in case of running CoCiP-style mixing
-        Vector_2D H2O_before_cocip, H2O_amb_after_cocip;
-        MaskType numberMask_before_cocip, numberMask_after_cocip;
-        if(COCIP_MIXING) {
-            H2O_before_cocip = H2O_;
-            numberMask_before_cocip = iceNumberMask();
-        }
 
         // Run Transport
         std::cout << "Running Transport" << std::endl;
@@ -77,13 +81,6 @@ SimStatus LAGRIDPlumeModel::runFullModel() {
 
         solarTime_h_ = ( timestepVars_.curr_Time_s + timestepVars_.TRANSPORT_DT / 2 ) / 3600.0;
         simTime_h_ = ( timestepVars_.curr_Time_s + timestepVars_.TRANSPORT_DT / 2 - timestepVars_.timeArray[0] ) / 3600;
-        if(COCIP_MIXING) {
-            Meteorology met_temp = met_;
-            met_temp.Update( timestepVars_.TRANSPORT_DT, solarTime_h_, simTime_h_);
-            H2O_amb_after_cocip = met_temp.H2O_field();
-            numberMask_after_cocip = iceNumberMask();
-            runCocipH2OMixing(H2O_before_cocip, H2O_amb_after_cocip, numberMask_before_cocip, numberMask_after_cocip);
-        }
 
         // Run Ice Growth
         if (simVars_.ICE_GROWTH && timestepVars_.checkTimeForIceGrowth()) {
@@ -91,17 +88,6 @@ SimStatus LAGRIDPlumeModel::runFullModel() {
             timestepVars_.lastTimeIceGrowth = timestepVars_.curr_Time_s + timestepVars_.dt;
             iceAerosol_.Grow( timestepVars_.ICE_GROWTH_DT, H2O_, met_.Temp(), met_.Press());
         }
-        // Vector_2D areas = VectorUtils::cellAreas(xEdges_, yEdges_);
-        // std::cout << "Num Particles: " << iceAerosol_.TotalNumber_sum(areas) << std::endl;
-        // std::cout << "Ice Mass: " << iceAerosol_.TotalIceMass_sum(areas) << std::endl;
-
-        //Perform Met Update, which includes the vertical advection and timestepping in other met variables
-        std::cout << "Updating Met..." << std::endl;
-        met_.Update( timestepVars_.TRANSPORT_DT, solarTime_h_, simTime_h_);
-
-        //Vertical advection shifts the y coordinates which are synced to altitude, so we need to update the y edges and coordinates here too.
-        yEdges_ = met_.yEdges();
-        yCoords_ = met_.yCoords(); 
 
         // Update the tracer of contrail influence to include all locations where we have ice
         // Set it to 1 when there's at least 1 particle per m3 
@@ -113,10 +99,6 @@ SimStatus LAGRIDPlumeModel::runFullModel() {
         }
 
         // Create the mask of cells to retain, and terminate if none left
-        //auto dataMask = iceNumberMask();
-        // WARNING: H2O approach may not work well with temperature
-        // fluctuation field active
-        //auto dataMask = H2OMask();
         auto dataMask = ContrailMask(1.0e-2);
         auto& mask = dataMask.first;
         auto& maskInfo = dataMask.second;
@@ -126,6 +108,46 @@ SimStatus LAGRIDPlumeModel::runFullModel() {
             status = SimStatus::Complete;
             break;
         }
+
+        // Convert all quantities from #/cm3 to #/#
+        // delta-P/delta-Z is proportional to number density, and accounts
+        // for temperature variation (because the calculation of yEdge
+        // included it). This uses the hydrostatic assumption:
+        //    dp/dz = -rho*g = -(n/V)Mg
+        Vector_3D& pdfRef = iceAerosol_.getPDF_nonConstRef();
+        auto pressureEdges = met_.PressEdges();
+        double localND;
+        #pragma omp parallel for
+        for (std::size_t j=0; j<yCoords_.size(); j++){
+            localND = (pressureEdges[j] - pressureEdges[j+1])/(yEdges_[j+1] - yEdges_[j]);
+            for (std::size_t i=0; i<xCoords_.size(); i++){
+                Contrail_[j][i] = Contrail_[j][i] / localND; // parts per trillion
+                H2O_[j][i] = H2O_[j][i] / localND; // parts per trillion
+                for(UInt n = 0; n < iceAerosol_.getNBin(); n++) {
+                    pdfRef[n][j][i] = pdfRef[n][j][i] / localND;
+                }
+            }
+        }
+
+        // Run vertical advection to get the new pressure edges
+        if (std::abs(met_.lastOmega()) > 1.0e-10){
+            std::cout << "DEBUG: Applying updraft of " << met_.lastOmega() << " Pa s-1" << std::endl;
+            met_.applyUpdraft(timestepVars_.TRANSPORT_DT);
+        }
+
+        // Read in the meteorology for the next time step, interpolating in time 
+        // This only affects the xInit_ values in the meteorology object, but does
+        // update altitudeInit_ and altitudeEdgesInit_ (pressureInit_ unchanged)
+        std::cout << "Updating Met..." << std::endl;
+        met_.Update( timestepVars_.TRANSPORT_DT, solarTime_h_, simTime_h_);
+        
+        // Determine the altitude of each pressure edge after vertical advection and the 
+        // application of new temperatures
+        met_.recalculateSimulationGrid();
+        
+        // Resynchronize the y coordinates
+        yEdges_ = met_.yEdges();
+        //yCoords_ = met_.yCoords(); // We didn't update met_.yCoords
 
         //Remap the grid to account for changes in shape due to vertical advection and the growth of the contrail
         std::cout << "Remapping... " << std::endl;
@@ -431,13 +453,8 @@ void LAGRIDPlumeModel::runTransport(double timestep) {
 }
 
 std::pair<LAGRID::twoDGridVariable,LAGRID::twoDGridVariable> LAGRIDPlumeModel::remapVariable(const VectorUtils::MaskInfo& maskInfo, const BufferInfo& buffers, const Vector_2D& phi, const std::vector<std::vector<int>>& mask) {
-    double dy_grid_old = yCoords_[1] - yCoords_[0];
     double dx_grid_old = xCoords_[1] - xCoords_[0];
-
-    // TODO: Add adaptive mesh size. This current implementation causes memory corruptions.
-    // We need an extra grid cell on each side to avoid dealing with nasty indexing edge cases
-    // if the boxes' and remapping's minX, maxX, minY, maxY are the same.
-    auto boxGrid = LAGRID::rectToBoxGrid(dy_grid_old, met_.dy_vec(), dx_grid_old, xEdges_[0], yEdges_[0], phi, mask);
+    auto boxGrid = LAGRID::rectToBoxGrid(met_.dy_vec(), dx_grid_old, xEdges_[0], yEdges_[0], phi, mask);
 
     //Enforce at least x many points in the contrail while limiting minimum/maximum dx and dy
     double dx_grid_new =  std::max(20.0, std::min((maskInfo.maxX - maskInfo.minX) / 50.0, 50.0));
@@ -526,7 +543,8 @@ void LAGRIDPlumeModel::remapAllVars(double remapTimestep, const std::vector<std:
 
     //Remap the tracer of contrail presence
     Contrail_ = applyWeights(remapWeights, nx_old,  ny_old,  nx_new,  ny_new, Contrail_);
-    //Remap H2O - but also return the fraction of each cell not written to
+
+    //Remap H2O
     H2O_ = applyWeights(remapWeights, nx_old,  ny_old,  nx_new,  ny_new, H2O_);
 
     //Need to update bottom-of-domain altitude before updating coordinates
@@ -538,26 +556,27 @@ void LAGRIDPlumeModel::remapAllVars(double remapTimestep, const std::vector<std:
     double dy = yEdges_[1] - yEdges_[0];
     std::cout << "dx: " << dx << ", dy: " << dy << std::endl;
 
-    //Regenerate Met based on new grid 
-    if(!optInput_.MET_LOADMET) {
-        //This way of regenning met is extremely stupid
-        OptInput temp_opt = optInput_;
-        temp_opt.ADV_GRID_NX = xCoords_.size();
-        temp_opt.ADV_GRID_NY = yCoords_.size();
-        temp_opt.ADV_GRID_XLIM_LEFT = -xEdges_[0];
-        temp_opt.ADV_GRID_XLIM_RIGHT = xEdges_[xEdges_.size() - 1];
-        temp_opt.ADV_GRID_YLIM_DOWN = -yEdges_[0];
-        temp_opt.ADV_GRID_YLIM_UP = -yEdges_[yEdges_.size() - 1];
-        AmbientMetParams ambParamsTemp;
-        ambParamsTemp.press_Pa = met_.referencePress();
-        ambParamsTemp.solarTime_h = solarTime_h_;
-        ambParamsTemp.temp_K = met_.tempRef();
-        ambParamsTemp.rhi = met_.rhiRef();
-        ambParamsTemp.shear = met_.shearRef();
-        met_ = Meteorology(temp_opt, ambParamsTemp, yCoords_, yEdges_);
-    }
-    else {
-        met_.regenerate(yCoords_, yEdges_, xCoords_.size());
+    // Synchronize the grid desscribed by the met data object
+    // and re-interpolate variables such as temperature
+    met_.regenerate(yCoords_, yEdges_, xCoords_.size());
+
+    // Convert back from v/v to number density.
+    // delta-P/delta-Z is proportional to number density, and accounts
+    // for temperature variation (because the calculation of yEdge
+    // included it). This uses the hydrostatic assumption:
+    //    dp/dz = -rho*g = -(n/V)Mg
+    auto pressureEdges = met_.PressEdges(); 
+    double localND;
+    #pragma omp parallel for
+    for (std::size_t j=0; j<yCoords_.size(); j++){
+        localND = (pressureEdges[j] - pressureEdges[j+1])/(yEdges_[j+1] - yEdges_[j]);
+        for (std::size_t i=0; i<xCoords_.size(); i++){
+            Contrail_[j][i] = Contrail_[j][i] * localND;
+            H2O_[j][i] = H2O_[j][i] * localND;
+            for(UInt n = 0; n < iceAerosol_.getNBin(); n++) {
+                pdfRef[n][j][i] = pdfRef[n][j][i] * localND;
+            }
+        }
     }
 
     // Set boundary locations to use meteorological H2O
@@ -578,26 +597,6 @@ void LAGRIDPlumeModel::remapAllVars(double remapTimestep, const std::vector<std:
     }
 }
 
-void LAGRIDPlumeModel::trimH2OBoundary() {
-    std::vector<std::pair<int, int>> boundaryIndices;
-    int ny = H2O_.size();
-    int nx = H2O_[0].size();
-    auto isBoundary = [this, nx, ny](int j, int i){
-        if(i == 0 || i == nx - 1 || j == 0 || j == ny - 1) return true;
-        return (H2O_[j+1][i] == 0 || H2O_[j-1][i] == 0 || H2O_[j][i-1] == 0 || H2O_[j][i+1] == 0);
-    };
-    for(int j = 0; j < ny; j++) {
-        for(int i = 0; i < nx; i++) {
-            if(isBoundary(j, i)) {
-                boundaryIndices.emplace_back(j, i);
-            }
-        }
-    }
-    for(auto& p: boundaryIndices) {
-        H2O_[p.first][p.second] = 0;
-    }
-}
-
 double LAGRIDPlumeModel::totalAirMass() {
     auto numberMask = iceNumberMask();
     auto& mask = numberMask.first;
@@ -612,46 +611,11 @@ double LAGRIDPlumeModel::totalAirMass() {
     return totalAirMass; // kg/m 
 }
 
-void LAGRIDPlumeModel::runCocipH2OMixing(const Vector_2D& h2o_old, const Vector_2D& h2o_amb_new, MaskType& mask_old, MaskType& mask_new) {
-    //h2o_old is the actual H2O field of the "before" timestep
-    double molec_h2o_old = 0;
-    for (std::size_t j = 0; j < h2o_old.size(); j++) {
-        for (std::size_t i = 0; i < h2o_old[0].size(); i++) {
-            molec_h2o_old += mask_old.first[j][i] * h2o_old[j][i];
-        }
-    }
-    //h2o_amb_new is the *ambient met* H2O field of the next timestep
-    double molec_h2o_amb_added = 0;
-    for (std::size_t j = 0; j < h2o_amb_new.size(); j++) {
-        for (std::size_t i = 0; i < h2o_amb_new[0].size(); i++) {
-            molec_h2o_amb_added += (mask_new.first[j][i] == 1 && mask_old.first[j][i] == 0) * h2o_amb_new[j][i];
-        }
-    }
-
-    double molec_h2o_final = molec_h2o_old + molec_h2o_amb_added; // molec/cm3
-    double average_amb_humidity_final = molec_h2o_final / mask_new.second.count;
-
-    for (std::size_t j = 0; j < H2O_.size(); j++)  {
-        for (std::size_t i = 0; i < H2O_[0].size(); i++) {
-            if(mask_new.first[j][i] == 1) {
-                H2O_[j][i] = average_amb_humidity_final;
-            }
-        }
-    }
-
-
-}
-
-
-// Create an array which 
+// Create an array which maps between 2D grids
 Eigen::SparseMatrix<double> LAGRIDPlumeModel::createRegriddingWeightsSparse(const VectorUtils::MaskInfo& maskInfo, const BufferInfo& buffers, const std::vector<std::vector<int>>& mask, Vector_1D& xEdgesNew, Vector_1D& yEdgesNew, Vector_1D& xCoordsNew, Vector_1D& yCoordsNew) {
     Vector_2D phi = Vector_2D(yCoords_.size(), Vector_1D(xCoords_.size()));
-    double dy_grid_old = yCoords_[1] - yCoords_[0];
     double dx_grid_old = xCoords_[1] - xCoords_[0];
-
-    // We need an extra grid cell on each side to avoid dealing with nasty indexing edge cases
-    // if the boxes' and remapping's minX, maxX, minY, maxY are the same.
-    auto boxGrid = LAGRID::rectToBoxGrid(dy_grid_old, met_.dy_vec(), dx_grid_old, xEdges_[0], yEdges_[0], phi, mask);
+    auto boxGrid = LAGRID::rectToBoxGrid(met_.dy_vec(), dx_grid_old, xEdges_[0], yEdges_[0], phi, mask);
 
     //Enforce at least x many points in the contrail while limiting minimum/maximum dx and dy
     double dx_grid_new =  std::max(20.0, std::min((maskInfo.maxX - maskInfo.minX) / 50.0, 50.0));
@@ -682,12 +646,8 @@ Eigen::SparseMatrix<double> LAGRIDPlumeModel::createRegriddingWeightsSparse(cons
     std::generate(xEdgesNew.begin(), xEdgesNew.end(), [dx, x0New, i = 0.0]() mutable { return x0New + dx*(i++ - 0.5); });
 
     
-    //Eigen::Matrix2d weights = LAGRID::generateWeights(boxGrid, remapping);
     int nx_old = phi[0].size();
     int ny_old = phi.size();
-
-    //std::cout << "Old domain: X " << xEdges_[0] << " to " << xEdges_[nx_old] << ", Y " << yEdges_[0] << " to " << yEdges_[ny_old] << std::endl;
-    //std::cout << "New domain: X " << xEdgesNew[0] << " to " << xEdgesNew[nx_new] << ", Y " << yEdgesNew[0] << " to " << yEdgesNew[ny_new] << std::endl;
 
     //Eigen::MatrixXd weights = Eigen::MatrixXd::Zero(nx_old*ny_old,nx_new*ny_new);
     std::vector<Eigen::Triplet<double>> sparseIJV;
