@@ -13,26 +13,26 @@ def write_to_plume_model(lines):
 
 def update_ithresh(ithresh: str = "1e6"):
     lines = read_plume_model()
-    iline = lines[110]
+    iline = lines[96]
 
     start_idx = iline.find('*') + 1
     end_idx = iline.find(')')
     iline_new = iline[:start_idx] + ithresh + iline[end_idx:]
 
     edited_lines = lines
-    edited_lines[110] = iline_new
+    edited_lines[96] = iline_new
     write_to_plume_model(edited_lines)
 
-def update_cthresh(cthresh: str = "0.01"):
+def update_cthresh(cthresh: str = "1.0e-2"):
     lines = read_plume_model()
-    iline = lines[119]
+    iline = lines[101]
 
     start_idx = iline.find('(') + 1
     end_idx = iline.find(')')
     iline_new = iline[:start_idx] + cthresh + iline[end_idx:]
 
     edited_lines = lines
-    edited_lines[119] = iline_new
+    edited_lines[101] = iline_new
     write_to_plume_model(edited_lines)
 
 def reset_plume_model():
