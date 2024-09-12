@@ -271,7 +271,7 @@ def eval_APCEMM(met_filepath = "inputs/met/test-APCEMM-met.nc",
     set_up_met(met_filepath=met_filepath)
 
     # Run APCEMM
-    os.system('./../../build_icenum0/APCEMM input.yaml')
+    os.system('./../../EXAMPLE/APCEMM input.yaml')
 
     return process_and_save_outputs(filepath=output_filepath)
 
